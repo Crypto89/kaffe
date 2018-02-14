@@ -46,7 +46,6 @@ func main() {
 	config := cluster.NewConfig()
 	config.Consumer.Return.Errors = true
 	config.Group.Return.Notifications = true
-	config.Consumer.Offsets.Initial = sarama.OffsetOldest
 	config.Version = version
 
 	consumer, err := cluster.NewConsumer(*kafkaBroker, *kafkaGroup, *kafkaTopic, config)
@@ -80,7 +79,7 @@ func main() {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			bulkProcessor(ctx, i, consumer.Messages())
+			bulkProcessor(ctx, i, consumer)
 		}(i)
 	}
 
@@ -94,15 +93,17 @@ func main() {
 	}
 }
 
-func bulkProcessor(ctx context.Context, worker int, c <-chan *sarama.ConsumerMessage) {
+func bulkProcessor(ctx context.Context, worker int, consumer *cluster.Consumer) {
 	log.WithField("worker", worker).Debug("Starting processor")
 	client := &http.Client{}
 
 	for {
 		var buffer bytes.Buffer
 		interval := *bulkFlushInterval
+
+		stash := cluster.NewOffsetStash()
 		bctx, cancel := context.WithTimeout(ctx, time.Duration(interval)*time.Second)
-		makeBulk(bctx, &buffer, c)
+		makeBulk(bctx, &buffer, consumer.Messages(), stash)
 		cancel()
 
 		if buffer.Len() != 0 {
@@ -126,6 +127,8 @@ func bulkProcessor(ctx context.Context, worker int, c <-chan *sarama.ConsumerMes
 					io.Copy(os.Stdout, resp.Body)
 					panic(err)
 				}
+			} else {
+				consumer.MarkOffsets(stash)
 			}
 
 			log.WithFields(log.Fields{"worker": worker, "status": resp.StatusCode}).Debugf("bulk flush complete")
@@ -142,12 +145,13 @@ func bulkProcessor(ctx context.Context, worker int, c <-chan *sarama.ConsumerMes
 	}
 }
 
-func makeBulk(ctx context.Context, w io.Writer, c <-chan *sarama.ConsumerMessage) {
+func makeBulk(ctx context.Context, w io.Writer, c <-chan *sarama.ConsumerMessage, stash *cluster.OffsetStash) {
 	for i := 0; i < *bulkSize; i++ {
 		select {
 		case msg := <-c:
 			fmt.Fprintln(w, "{\"index\": {}}")
 			w.Write(msg.Value)
+			stash.MarkOffset(msg, "")
 			fmt.Fprintf(w, "\n")
 		case <-ctx.Done():
 			return
